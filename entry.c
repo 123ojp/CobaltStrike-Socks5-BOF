@@ -30,13 +30,14 @@
  *
  *   u32 magic        0x53355231 ("S5R1")
  *   u32 op           CONNECT(1) READ(2) WRITE(3) CLOSE(4) PING(5) RESET(6)
+ *                    WRITE_READ(7)
  *   u32 stream_id
  *   u32 timeout_ms   0 = operation default
  *   u32 payload_len
  *   u8  payload[payload_len]
  *
  * CONNECT payload: u16 port_be | host bytes (no NUL)
- * READ    payload: u32 max_bytes (optional; 0 = 8192)
+ * READ    payload: u32 max_bytes (optional; 0 = 32768)
  * WRITE   payload: raw bytes
  * CLOSE/RESET/PING: no payload
  *
@@ -65,6 +66,7 @@
 #define OP_CLOSE            4
 #define OP_PING             5
 #define OP_RESET            6
+#define OP_WRITE_READ       7
 
 #define R_OK                0
 #define R_AGAIN             1
@@ -73,7 +75,7 @@
 #define R_BAD               4
 
 #define MAX_STREAMS         16
-#define MAX_CHUNK           8192
+#define MAX_CHUNK           32768
 #define MAX_HOST            255
 
 #define DEF_CONNECT_TIMEOUT 4000
@@ -282,6 +284,13 @@ static int resolve_host(const char *host, unsigned long *addr)
 	return 1;
 }
 
+static void set_nodelay(SOCKET sock)
+{
+	int one = 1;
+	WS2_32$setsockopt(sock, IPPROTO_TCP, TCP_NODELAY,
+	                  (const char *)&one, (int)sizeof(one));
+}
+
 static void op_connect(S5_STATE *st, unsigned int id, unsigned int timeout,
                        const unsigned char *payload, int len)
 {
@@ -327,6 +336,7 @@ static void op_connect(S5_STATE *st, unsigned int id, unsigned int timeout,
 		            NULL, 0);
 		return;
 	}
+	set_nodelay(sock);
 
 	{
 		u_long one = 1;
@@ -442,7 +452,20 @@ static void op_read(S5_STATE *st, unsigned int id, unsigned int timeout,
 
 	n = WS2_32$recv(s->s, (char *)buf, (int)max, 0);
 	if (n > 0) {
-		emit_result(id, R_OK, 0, buf, n);
+		int total = n;
+
+		/* Drain everything already queued in the socket buffer. */
+		while ((unsigned int)total < max) {
+			int more = WS2_32$recv(s->s, (char *)buf + total,
+			                       (int)(max - (unsigned int)total), 0);
+			if (more > 0) {
+				total += more;
+				continue;
+			}
+			break;
+		}
+
+		emit_result(id, R_OK, 0, buf, total);
 	} else if (n == 0) {
 		emit_result(id, R_EOF, 0, NULL, 0);
 	} else {
@@ -454,26 +477,11 @@ static void op_read(S5_STATE *st, unsigned int id, unsigned int timeout,
 	}
 }
 
-static void op_write(S5_STATE *st, unsigned int id, unsigned int timeout,
-                     const unsigned char *payload, int len)
+static int stream_send(S5_STREAM *s, const unsigned char *payload, int len,
+                       unsigned int wait_ms)
 {
-	S5_STREAM *s;
-	unsigned int wait_ms;
-	DWORD started;
+	DWORD started = KERNEL32$GetTickCount();
 	int sent = 0;
-
-	s = stream_find(st, id);
-	if (s == NULL) {
-		emit_result(id, R_ERR, WSAENOTCONN, NULL, 0);
-		return;
-	}
-	if (len <= 0) {
-		emit_result(id, R_OK, 0, NULL, 0);
-		return;
-	}
-
-	wait_ms = clamp_timeout(timeout, DEF_WRITE_TIMEOUT);
-	started = KERNEL32$GetTickCount();
 
 	while (sent < len) {
 		int rc = WS2_32$send(s->s, (const char *)payload + sent,
@@ -491,38 +499,126 @@ static void op_write(S5_STATE *st, unsigned int id, unsigned int timeout,
 			struct timeval tv;
 			int sr;
 
-			if (elapsed >= wait_ms) {
-				emit_result(id, R_ERR, WSAETIMEDOUT, NULL, 0);
-				return;
-			}
+			if (elapsed >= wait_ms)
+				return WSAETIMEDOUT;
 
 			FD_ZERO(&wf);
 			FD_SET(s->s, &wf);
 			tv_from_ms(&tv, wait_ms - elapsed);
 			sr = WS2_32$select(0, NULL, &wf, NULL, &tv);
-			if (sr == 0) {
-				emit_result(id, R_ERR, WSAETIMEDOUT, NULL, 0);
-				return;
-			}
-			if (sr == SOCKET_ERROR) {
-				emit_result(id, R_ERR,
-				            (unsigned int)WS2_32$WSAGetLastError(),
-				            NULL, 0);
-				return;
-			}
+			if (sr == 0)
+				return WSAETIMEDOUT;
+			if (sr == SOCKET_ERROR)
+				return WS2_32$WSAGetLastError();
 			continue;
 		}
 
-		{
-			int err = (rc == SOCKET_ERROR)
-			          ? WS2_32$WSAGetLastError()
-			          : 0;
-			emit_result(id, R_ERR, (unsigned int)err, NULL, 0);
-		}
+		return (rc == SOCKET_ERROR) ? WS2_32$WSAGetLastError() : 0;
+	}
+	return 0;
+}
+
+static void op_write(S5_STATE *st, unsigned int id, unsigned int timeout,
+                     const unsigned char *payload, int len)
+{
+	S5_STREAM *s;
+	int err;
+
+	s = stream_find(st, id);
+	if (s == NULL) {
+		emit_result(id, R_ERR, WSAENOTCONN, NULL, 0);
+		return;
+	}
+	if (len <= 0) {
+		emit_result(id, R_OK, 0, NULL, 0);
 		return;
 	}
 
-	emit_result(id, R_OK, 0, NULL, 0);
+	err = stream_send(s, payload, len,
+	                  clamp_timeout(timeout, DEF_WRITE_TIMEOUT));
+	if (err != 0)
+		emit_result(id, R_ERR, (unsigned int)err, NULL, 0);
+	else
+		emit_result(id, R_OK, 0, NULL, 0);
+}
+
+/*
+ * Send client bytes and, in the same BOF invocation, wait for the server
+ * response.  This removes one Beacon task round trip from every
+ * request/response exchange (the common case for RDP).
+ *
+ * Result status:
+ *   OK    - write succeeded and server data follows (possibly 0 bytes)
+ *   AGAIN - write succeeded, no server data within the read window
+ *   EOF   - write succeeded, server closed its side
+ *   ERR   - write or read failed; the stream is unusable
+ */
+static void op_write_read(S5_STATE *st, unsigned int id, unsigned int timeout,
+                          const unsigned char *payload, int len)
+{
+	static unsigned char buf[MAX_CHUNK];
+	S5_STREAM *s;
+	unsigned int max = MAX_CHUNK;
+	unsigned int wait_ms;
+	fd_set rf;
+	struct timeval tv;
+	int rc;
+	int n;
+	int err;
+
+	s = stream_find(st, id);
+	if (s == NULL) {
+		emit_result(id, R_ERR, WSAENOTCONN, NULL, 0);
+		return;
+	}
+
+	if (len > 0) {
+		err = stream_send(s, payload, len, DEF_WRITE_TIMEOUT);
+		if (err != 0) {
+			emit_result(id, R_ERR, (unsigned int)err, NULL, 0);
+			return;
+		}
+	}
+
+	wait_ms = clamp_timeout(timeout, DEF_READ_TIMEOUT);
+	FD_ZERO(&rf);
+	FD_SET(s->s, &rf);
+	tv_from_ms(&tv, wait_ms);
+
+	rc = WS2_32$select(0, &rf, NULL, NULL, &tv);
+	if (rc == 0) {
+		emit_result(id, R_AGAIN, 0, NULL, 0);
+		return;
+	}
+	if (rc == SOCKET_ERROR) {
+		emit_result(id, R_ERR, (unsigned int)WS2_32$WSAGetLastError(),
+		            NULL, 0);
+		return;
+	}
+
+	n = WS2_32$recv(s->s, (char *)buf, (int)max, 0);
+	if (n > 0) {
+		int total = n;
+
+		while ((unsigned int)total < max) {
+			int more = WS2_32$recv(s->s, (char *)buf + total,
+			                       (int)(max - (unsigned int)total), 0);
+			if (more > 0) {
+				total += more;
+				continue;
+			}
+			break;
+		}
+		emit_result(id, R_OK, 0, buf, total);
+	} else if (n == 0) {
+		emit_result(id, R_EOF, 0, NULL, 0);
+	} else {
+		err = WS2_32$WSAGetLastError();
+		if (err == WSAEWOULDBLOCK)
+			emit_result(id, R_AGAIN, 0, NULL, 0);
+		else
+			emit_result(id, R_ERR, (unsigned int)err, NULL, 0);
+	}
 }
 
 /* ---- entry point ----------------------------------------------------- */
@@ -592,6 +688,9 @@ void go(char *args, int alen)
 		break;
 	case OP_WRITE:
 		op_write(st, id, timeout, payload, (int)plen);
+		break;
+	case OP_WRITE_READ:
+		op_write_read(st, id, timeout, payload, (int)plen);
 		break;
 	case OP_CLOSE: {
 		S5_STREAM *s = stream_find(st, id);

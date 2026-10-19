@@ -21,6 +21,7 @@ import os
 import queue
 import re
 import select
+import signal
 import socket
 import ssl
 import struct
@@ -38,6 +39,7 @@ OP_WRITE = 3
 OP_CLOSE = 4
 OP_PING = 5
 OP_RESET = 6
+OP_WRITE_READ = 7
 
 R_OK = 0
 R_AGAIN = 1
@@ -45,7 +47,7 @@ R_EOF = 2
 R_ERR = 3
 R_BAD = 4
 
-MAX_CHUNK = 8192
+MAX_CHUNK = 32768
 MAX_STREAMS = 16
 
 RESULT_RE = re.compile(
@@ -354,6 +356,10 @@ class SocksConnection(threading.Thread):
     def __init__(self, conn, peer, runner, stream_ids, config):
         super().__init__(daemon=True)
         self.conn = conn
+        try:
+            conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        except OSError:
+            pass
         self.peer = peer
         self.runner = runner
         self.stream_ids = stream_ids
@@ -464,16 +470,33 @@ class SocksConnection(threading.Thread):
                     return
                 if not data:
                     return
-                _, status, _, _ = self.runner.run_sync(
-                    OP_WRITE, self.stream_id, data,
-                    self.config.write_timeout_ms,
+                # Send the client bytes and wait for the server response in
+                # the same BOF task.  This removes one task round trip per
+                # request/response exchange.
+                _, status, _, response = self.runner.run_sync(
+                    OP_WRITE_READ, self.stream_id, data,
+                    self.config.read_timeout_ms,
                     self.config.op_timeout,
                 )
-                if status != R_OK:
+                if status == R_OK:
+                    if response:
+                        try:
+                            self.conn.sendall(response)
+                        except OSError:
+                            return
+                elif status == R_AGAIN:
+                    # Write succeeded; the server response is not ready.
+                    pass
+                elif status == R_EOF:
+                    try:
+                        self.conn.shutdown(socket.SHUT_WR)
+                    except OSError:
+                        return
+                    self._drain_client()
                     return
-                # Alternate directions so a busy upload cannot starve
-                # downstream data (and vice versa).
-                wrote = True
+                else:
+                    return
+                wrote = False
                 continue
 
             wrote = False
@@ -605,9 +628,9 @@ def parse_args():
     parser.add_argument("--drain-timeout", type=float, default=5.0,
                         help="Seconds to keep forwarding client data after "
                              "the target sends EOF")
-    parser.add_argument("--poll-interval", type=float, default=0.25)
+    parser.add_argument("--poll-interval", type=float, default=0.1)
     parser.add_argument("--max-clients", type=int, default=MAX_STREAMS)
-    parser.add_argument("--idle-poll-ms", type=int, default=100,
+    parser.add_argument("--idle-poll-ms", type=int, default=25,
                         help="Pause after an empty READ before polling again")
     parser.add_argument("--reset", action="store_true",
                         help="Send RESET (close all BOF-held sockets) and exit")
@@ -618,6 +641,13 @@ def parse_args():
 
 
 def main():
+    if os.name == "nt":
+        # Make CTRL_BREAK_EVENT behave like Ctrl+C so the finally block
+        # runs and --reset-on-exit can close the target sockets.
+        try:
+            signal.signal(signal.SIGBREAK, signal.default_int_handler)
+        except (AttributeError, ValueError):
+            pass
     args = parse_args()
     if not args.password:
         raise SystemExit("REST password required (--password or "

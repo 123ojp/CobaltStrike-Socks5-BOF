@@ -14,6 +14,7 @@ Controls:
   s                                       stop the proxy
   r                                       refresh now
   q                                       quit (proxy keeps running)
+  Ctrl+C                                  quit and stop the proxy
 
 Switching Beacons drops existing SOCKS connections because the target sockets
 live in the old Beacon's BOF state.
@@ -24,6 +25,7 @@ import contextlib
 import os
 import queue
 import select
+import signal
 import socket
 import subprocess
 import sys
@@ -89,6 +91,8 @@ def read_key_now():
             }.get(ch2, "none")
         if ch in ("\r", "\n"):
             return "enter"
+        if ch == "\x03":
+            return "interrupt"
         if ch == "\x1b":
             return "quit"
         low = ch.lower()
@@ -101,6 +105,8 @@ def read_key_now():
     ch = os.read(fd, 1)
     if not ch:
         return "quit"
+    if ch == b"\x03":
+        return "interrupt"
     if ch == b"\x1b":
         # Terminals send either CSI ("\x1b[A") or SS3 ("\x1bOA") for arrows.
         # Read the rest of the sequence without blocking the UI.
@@ -389,12 +395,24 @@ class Picker:
                 self.proc_state = "stopping"
                 self.message = "stopping pid=%s..." % proc.pid
         if proc is not None and proc.poll() is None:
-            proc.terminate()
+            # Ask the child to shut down cleanly first so its finally block
+            # can run (and send RESET when --reset-on-exit is enabled).
+            try:
+                if IS_WINDOWS:
+                    proc.send_signal(signal.CTRL_BREAK_EVENT)
+                else:
+                    proc.send_signal(signal.SIGINT)
+            except (OSError, ValueError):
+                pass
             try:
                 proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
-                proc.kill()
-                proc.wait()
+                proc.terminate()
+                try:
+                    proc.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait()
         with self.lock:
             self.proc = None
             self.proc_bid = None
@@ -467,6 +485,8 @@ class Picker:
                 "--read-timeout-ms", str(self.args.read_timeout_ms),
                 "--connect-timeout-ms", str(self.args.connect_timeout_ms),
                 "--write-timeout-ms", str(self.args.write_timeout_ms),
+                "--reset-on-start",
+                "--reset-on-exit",
                 "--verbose",
             ]
             if self.args.bof:
@@ -697,6 +717,7 @@ def main():
     sys.stdout.flush()
     first = True
     last_render = 0.0
+    interrupted = False
     try:
         with raw_terminal():
             while True:
@@ -718,6 +739,9 @@ def main():
                             target=picker.refresh_once, daemon=True).start()
                         with picker.lock:
                             picker.message = "refreshing..."
+                    elif key == "interrupt":
+                        interrupted = True
+                        break
                     elif key == "quit":
                         break
                     picker.poll_child()
@@ -732,9 +756,11 @@ def main():
                 else:
                     picker.poll_child()
     except KeyboardInterrupt:
-        pass
+        interrupted = True
     finally:
         picker.shutdown()
+        if interrupted:
+            picker._terminate_child(send_reset=False)
         sys.stdout.write(SHOW_CURSOR + "\n")
         sys.stdout.flush()
 

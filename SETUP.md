@@ -626,24 +626,13 @@ socks5_reset <bid>
 
 There are two different things called "SOCKS" in Cobalt Strike.
 
-### 8.1 Built-in SOCKS5 pivot (fully GUI-managed)
+### 8.1 Built-in SOCKS5 pivot (not used)
 
-Cobalt Strike 4.13 has a built-in SOCKS5 pivot. From the Beacon context menu:
-
-```
-Beacon -> Pivots -> SOCKS Server
-```
-
-or via REST:
-
-```
-POST /api/v1/beacons/{bid}/execute/socks5Start
-```
-
-This listener runs on the **team server**, not on the operator workstation, and
-traffic still goes through the Beacon C2 channel. It is the simplest
-GUI-integrated option and does not use this project's BOF or orchestrator.
-Use it if a team-server-side listener is acceptable.
+Cobalt Strike 4.13 also ships a built-in SOCKS5 pivot (`Beacon -> Pivots ->
+SOCKS Server`). It runs on the team server and uses Cobalt Strike's native
+pivot/job machinery. It is faster for interactive traffic, but it is outside
+this project's design; this project does not use it. See section 8.3 for the
+measured comparison.
 
 ### 8.2 This task-pump project
 
@@ -679,6 +668,48 @@ To get GUI start/stop/switch buttons for the Python orchestrator, a small CNA
 wrapper can be added that launches `socks5_orchestrator.py` on the client
 machine. It is not included yet; for now use the PowerShell commands in
 section 7.
+
+### 8.3 RDP and other latency-sensitive protocols
+
+The BOF task pump performs one Beacon task per operation. Cobalt Strike
+dispatches and returns tasks on Beacon check-in, and a Beacon checks in about
+once per second even at `sleep=0`. `sleep=0` is not a continuous connection.
+The REST client can poll every 20 ms, but the task cannot run or return until
+the next check-in.
+
+Measured in the test environment:
+
+| Measurement | Result |
+| --- | --- |
+| Beacon check-in interval, `sleep=0` | ~0.98-1.01 s |
+| PING task: submit -> 404 -> COMPLETED | 0.06 s -> 0.76 s |
+| REST request duration | 20-80 ms |
+| RDP X.224 via task pump (`CONNECT` + `WRITE_READ`, `sleep=1`) | ~1.98 s |
+| RDP X.224 via built-in native SOCKS (comparison only) | ~0.18 s |
+
+The built-in `socks` command is faster because it uses Cobalt Strike's native
+pivot/job machinery, not one BOF task per I/O. This project intentionally does
+not use it; the comparison explains the gap, not a recommendation.
+
+Even with a custom thread, a BOF has no public API for the operator to send
+data into the running BOF. The thread can hold the target socket, but client
+data still arrives as tasks and waits for a check-in. A fully bidirectional,
+low-latency relay needs the native job channel (or a separate tunnel), both
+outside this project's design.
+
+If you need RDP through the task pump:
+
+* reduce the number of exchanges: disable audio, clipboard, drive redirection,
+  and GFX; use 16 bpp, a low resolution, a single monitor, and no font
+  smoothing;
+* keep `--read-timeout-ms` at 500 or lower and use a short Beacon sleep;
+* expect the first connection to take tens of seconds and interactive use to
+  remain slow;
+* for production RDP, use a persistent tunnel outside this project's
+  no-thread/no-process constraints.
+
+Do not raise `--read-timeout-ms` to compensate; a longer read timeout only adds
+delay when the target has no data.
 
 ---
 
@@ -766,12 +797,13 @@ or skip x86 Beacons.
 
 ### High latency / low throughput
 
-Expected. Each operation is a separate BOF task bounded by the Beacon sleep
-interval and REST polling. For interactive use:
+Expected. The dominant limit is the Beacon task check-in interval (~1 s even at
+`sleep=0`), not REST polling or `--idle-poll-ms`. For interactive use:
 
-* set Beacon sleep to 1
-* use `--read-timeout-ms 500` or lower
-* avoid bulk transfers
+* keep `--read-timeout-ms` at 500 or lower;
+* use a short sleep to control task volume, not to remove the check-in floor;
+* avoid bulk transfers;
+* for RDP, see section 8.3.
 
 ---
 
